@@ -2,9 +2,33 @@
 
 ## AI Usage
 
-*(To be completed in Milestone 4, after all bugs are fixed — this section will describe
-specifically what I asked AI tools to explain/trace/summarize during navigation and
-debugging, and where I verified or overrode their output.)*
+I used Claude Code (Anthropic's CLI agent) throughout this project, directing it at each
+milestone rather than asking it to "find and fix the bugs" outright.
+
+- **Codebase orientation:** Had it read every file in `routes/`, `services/`, `models.py`,
+  `seed_data.py`, and the existing tests, then write the codebase map and trace the
+  add-to-playlist → notification data flow. I reviewed the map for accuracy against the actual
+  files rather than taking it at face value.
+- **Reproduction:** For each issue, had it write small standalone Python scripts that imported
+  the relevant service function directly and called it with controlled inputs (the same
+  "isolate the function in a shell" technique suggested in the project brief), rather than
+  asking it to guess the bug from reading the code alone.
+- **Issue #2 specifically:** My first hypothesis (mine and the AI's) was a timezone/naive-vs-aware
+  datetime bug, since SQLite silently drops `tzinfo` on round-trip. That turned out to be a red
+  herring — printing the compiled SQL with literal binds showed the filter was evaluating
+  correctly at whatever threshold it was given. The AI caught this by checking the raw SQL
+  before concluding, rather than stopping at the first plausible-looking theory.
+- **Issue #3 specifically:** This is the one case where the "obvious" bug theory (a join fan-out
+  producing duplicate rows) did not empirically reproduce. Rather than accept the theory because
+  it matched the existing test's comment, the AI verified with raw SQL execution vs. ORM-level
+  results, and found SQLAlchemy's legacy `Query.all()` auto-deduplicates by primary key. I asked
+  it to keep digging for an alternate trigger before accepting this conclusion; it checked several
+  more angles (session wrapping, pagination) and I agreed with its final call to document this as
+  an investigation rather than force a fix for behavior that isn't currently broken.
+- **Fix verification:** For every fix, it re-ran the full test suite plus targeted manual checks
+  (e.g., self-rating should not self-notify; the activity feed should be unaffected by the
+  feed-threshold change) before I considered the fix done. I reviewed each diff before it was
+  committed.
 
 ---
 
@@ -118,3 +142,130 @@ module but never reaches `create_notification()`, which is directly relevant to 
   (`create_notification`). Every feature that wants to notify someone is expected to call it
   explicitly — there's no automatic hook or event system, so adding a new notification trigger
   is a manual, easy-to-forget step per feature.
+
+---
+
+## Root Cause Analysis
+
+### Issue #1 — My listening streak keeps resetting
+
+**How I reproduced it:** Called `update_listening_streak()` directly on a fresh user with a
+Saturday timestamp, then a consecutive Sunday timestamp (same scenario as the existing
+`tests/test_streaks.py::test_streak_increments_on_sunday`). Streak went to 1 after Saturday as
+expected, but stayed at 1 after Sunday instead of incrementing to 2. Ran the full test suite —
+that one test failed before any code changes.
+
+**How I found the root cause:** `streak_service.py` is short, so I read
+`update_listening_streak()` top to bottom against its own docstring, which states the rule as
+simply "if the user listened yesterday: streak increments by 1." The actual code read:
+`elif days_since_last == 1 and today.weekday() != 6:` — an extra condition not mentioned
+anywhere in the docstring. Confirmed `datetime.weekday()` returns `6` for Sunday.
+
+**The root cause:** The consecutive-day increment branch required both a 1-day gap *and*
+`today.weekday() != 6`. Any consecutive-day listen that happened to land on a Sunday failed
+that second condition and fell through to the `else` branch, resetting the streak to 1 even
+though the user hadn't skipped a day.
+
+**My fix and side-effect check:** Removed the `and today.weekday() != 6` clause, leaving
+`elif days_since_last == 1:` as the sole condition for incrementing, matching the documented
+rule. Verified `test_streak_increments_on_sunday` now passes, and re-ran the other three streak
+tests (starts-at-1, same-day no double-count, skip-a-day resets) to confirm none regressed.
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it:** Called `get_friends_listening_now()` for every seeded user and printed
+each returned event's age. Found friends showing up as "listening now" from as far back as
+~18 hours ago — e.g. darius and simone both saw nova's listening event from 2 hours prior.
+
+**How I found the root cause:** `feed_service.py` defines `RECENT_THRESHOLD = timedelta(hours=24)`
+and filters `ListeningEvent.listened_at >= cutoff` using it. I first suspected a timezone
+bug (SQLite drops tzinfo on round-trip — confirmed this separately by inspecting raw column
+values), but printing the compiled SQL with literal binds and cross-checking every event's
+inclusion against the filter showed the query itself was filtering exactly at the 24-hour mark,
+correctly. The threshold value itself was the problem. Cross-referencing `seed_data.py`'s own
+comments — "Recent events (within the past 30 minutes) — should appear," "Older events...
+should NOT appear" — confirmed the intended recency window is far tighter than 24 hours.
+
+**The root cause:** `RECENT_THRESHOLD` was set to 24 hours, appropriate for a daily digest but
+not for a "currently listening" feed. Any friend who listened at any point in the last day
+qualified as "listening now," so someone who listened yesterday afternoon would still appear as
+if they were listening right now.
+
+**My fix and side-effect check:** Changed `RECENT_THRESHOLD` to `timedelta(minutes=30)`,
+matching the boundary implied by the seed data comments. Verified friends whose only event is
+2+ hours old no longer appear, while friends with a sub-20-minute-old event still do. Checked
+`get_activity_feed()` (the non-recency-filtered sibling feature that shares this module) and
+confirmed it was unaffected — it still returns all 8 events for nova's friends since it doesn't
+use `RECENT_THRESHOLD` at all.
+
+### Issue #4 — I got notified about a playlist add but not a rating
+
+**How I reproduced it:** Called `rate_song()` with a `user_id` different from the song's
+`shared_by`, then checked `get_notifications(sharer_id)` before and after — the count stayed at
+0 both times, with no error raised.
+
+**How I found the root cause:** Per the assignment hint, compared `rate_song()` line-by-line
+against the working `add_to_playlist()` in the same file. `add_to_playlist()` ends with:
+`if song.shared_by != added_by_user_id: create_notification(...)`. `rate_song()` has no
+equivalent block at all — it upserts the `Rating` row, commits, and returns immediately.
+
+**The root cause:** `notification_service.py` has a single generic `create_notification()`
+writer that every feature must explicitly call to trigger a notification — there's no
+automatic hook. `add_to_playlist()` was wired up to call it; `rate_song()` simply never was.
+This is a missing integration, not a broken conditional — the architecture requires every
+notification-worthy action to remember to call the writer, and this one didn't.
+
+**My fix and side-effect check:** Added the same shaped guard to the end of `rate_song()` —
+`if song.shared_by != user_id: create_notification(...)` — using a new `"song_rated"`
+notification type and a body message parallel to the existing `"song_added_to_playlist"` one.
+Verified rating a friend's song now produces exactly one notification, and rating your own song
+produces zero (no self-notification), mirroring the guard already used in `add_to_playlist()`.
+Added `tests/test_notifications.py` covering both cases, since this module had no test coverage
+at all before this fix.
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it:** Called `get_playlist_songs()` on a seeded 7-song playlist and compared
+the returned count (6) against the playlist's actual song count (7). Also ran the existing
+tests — `test_playlist_returns_all_songs` and `test_playlist_returns_songs_in_order` both
+failed before any code changes.
+
+**How I found the root cause:** `playlist_service.py` is short. `get_playlist_songs()` builds a
+correctly-ordered query (`order_by(asc(playlist_entries.c.position))`) and then does
+`[song.to_dict() for song in songs[:-1]]` — the `[:-1]` slice stood out immediately, since it
+directly contradicts the function's own docstring note: "This function returns all songs in
+the playlist."
+
+**The root cause:** The list comprehension sliced off the last element of the
+already-correctly-ordered `songs` list before converting to dicts, unconditionally dropping the
+final song of every playlist regardless of size.
+
+**My fix and side-effect check:** Removed the `[:-1]` slice so the full ordered list is
+returned. Verified both previously-failing tests now pass (all 5 songs returned, in
+`Track 1..5` order), and re-checked `test_empty_playlist_returns_empty_list` still passes —
+confirming no new off-by-one at the empty-list boundary.
+
+### Issue #3 — The same song keeps showing up twice in search (investigated, not reproducible)
+
+**How I attempted to reproduce it:** Called `search_songs()` directly against the seeded
+3-tag song ("Crown Heights Anthem") and with broad queries matching up to 13 songs at once,
+checking for any repeated song `id` in the results. Every attempt returned zero duplicates.
+Ran the existing test suite — `test_search_no_duplicates_multi_tag_song` (whose own comment
+reads "Should be 1, bug causes it to be 3") currently **passes**.
+
+**Investigation:** `search_service.py` does `db.session.query(Song).outerjoin(song_tags,
+Song.id == song_tags.c.song_id).filter(...).all()`. Compiling and running the raw SQL directly
+(bypassing the ORM's row processing) confirmed the join does fan out to 3 raw rows for a song
+with 3 tags, as the bug theory predicts. But `db.session.query(Song)...all()` is SQLAlchemy's
+legacy `Query` API, which automatically de-duplicates full-entity results by primary key before
+returning them — confirmed by checking `id()` of the returned Python objects (a single object,
+not three references to the same object). This auto-dedup behavior applies regardless of query
+string, tag count, or whether the join is inner or outer, so there's no reachable condition
+through this function, as currently written, that produces a visible duplicate with the
+installed `sqlalchemy==2.0.51` (matching the `sqlalchemy>=2.0.0` pin in `requirements.txt`).
+
+**Conclusion:** No code change made for this issue. The join-fanout theory is correct at the
+raw-SQL level, but it's absorbed by the ORM's built-in de-duplication before it ever reaches a
+caller — the existing regression test already documents and passes this. I'm noting this as a
+documented investigation rather than a fix, since I don't have evidence the described behavior
+is currently reachable.
